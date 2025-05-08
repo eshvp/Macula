@@ -1,0 +1,4 @@
+First Name: Aiden
+Last Name: Ramsey
+Capture Date: 2025-03-25 23:21:53
+Number of Frames: 10

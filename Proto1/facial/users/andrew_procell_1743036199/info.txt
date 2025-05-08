@@ -1,0 +1,4 @@
+First Name: Andrew
+Last Name: Procell
+Capture Date: 2025-03-26 20:43:20
+Number of Frames: 10

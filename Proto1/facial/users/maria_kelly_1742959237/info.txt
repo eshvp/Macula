@@ -1,0 +1,4 @@
+First Name: Maria
+Last Name: Kelly
+Capture Date: 2025-03-25 23:20:37
+Number of Frames: 10

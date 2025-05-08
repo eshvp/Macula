@@ -1,0 +1,11 @@
+pip install faiss-cpu  # or faiss-gpu for GPU acceleration
+
+For now use cpu
+For larger data sets, use GPU
+
+
+03/21/2025 1:05 
+Regarding recognition.py
+- Trying to speed up the loading of users for recogntion function. Seems like paralleling will help (duh). Also GPU acceleration (duh).
+- Apparently 'You're running the detector on every image rather than caching the face location.' - Gotta fix that. 
+- Database rebuilding:  You're completely rebuilding the FAISS index and database each time.

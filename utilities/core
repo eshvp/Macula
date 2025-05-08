@@ -1,0 +1,13 @@
+# Add vertical line down the center of face
+center_x = x + w//2
+cv2.line(image, (center_x, y), (center_x, y + h), (0, 0, 255), 2)  # Red vertical line
+
+# Add horizontal line across the middle of face
+center_y = y + h//2
+cv2.line(image, (x, center_y), (x + w, center_y), (0, 0, 255), 2)  # Red horizontal line
+
+# Add horizontal line between eyes (approximately 1/3 from top of face)
+eye_level_y = y + (h // 3)
+cv2.line(image, (x, eye_level_y), (x + w, eye_level_y), (0, 0, 255), 2)  # Red eye line
+
+# This file is part of the utilities/core project. The metrics of face detection that I determine is absolutely necessary.
