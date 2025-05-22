@@ -1,0 +1,4 @@
+First Name: Mike
+Last Name: Jones
+Capture Date: 2025-05-15 17:56:01
+Number of Frames: 10
