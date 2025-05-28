@@ -1,3 +1,11 @@
+import sys
+from pathlib import Path
+
+# Add the parent directory of 'Proto1/facial/' to sys.path
+sys.path.append(str(Path(__file__).parent.parent.parent))
+
+from data.users import user_manager
+
 import cv2
 import dlib
 import numpy as np
@@ -12,7 +20,7 @@ class FaceRecognizer:
     def __init__(self, recognition_threshold=0.6):
         """Initialize the face recognizer with models and thresholds"""
         # Path to face recognition model
-        models_dir = Path(__file__).parent.parent / "models"
+        models_dir = Path(__file__).parent.parent.parent / "models"
         self.face_rec_model_path = models_dir / "dlib_face_recognition_resnet_model_v1.dat"
         self.shape_predictor_path = models_dir / "shape_predictor_68_face_landmarks.dat"
         

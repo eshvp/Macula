@@ -2,438 +2,516 @@ import cv2
 import dlib
 import numpy as np
 import os
+import sys
+from pathlib import Path
 import time
-import threading
-from queue import Queue
-from stored_data.UserProfiles import UserProfiles
+import faiss  # Facebook AI Similarity Search library
+import sqlite3
+import pickle
+import numpy as np
 
-class FaceRecognition:
-    def __init__(self):
-        # Enable dlib CUDA acceleration if available
-        if dlib.DLIB_USE_CUDA:
-            print("CUDA acceleration enabled for dlib")
-        
-        # Use frontal face detector with default parameters
-        self.detector = dlib.get_frontal_face_detector()
-        
-        # Load models with proper error handling
-        try:
-            model_path = os.path.join("models", "dlib_face_recognition_resnet_model_v1.dat")
-            shape_path = os.path.join("models", "shape_predictor_68_face_landmarks.dat")
-            
-            if not os.path.exists(model_path) or not os.path.exists(shape_path):
-                raise FileNotFoundError(f"Required model files not found. Please check: {model_path} and {shape_path}")
-                
-            self.face_recognizer = dlib.face_recognition_model_v1(model_path)
-            self.shape_predictor = dlib.shape_predictor(shape_path)
-        except Exception as e:
-            print(f"Error loading models: {e}")
-            raise
-        
-        # Load user profiles
-        self.user_profiles = UserProfiles()
-        self.threshold = 0.6
-        
-        # Pre-load all user encodings
-        self.reference_encodings = {}
-        self._load_user_encodings()
-        
-        # Cache for recent recognitions to avoid redundant processing
-        self.recognition_cache = {}
-        self.cache_lifetime = 2.0  # seconds
-        
-        # Track the last detected face for faster tracking
-        self.last_face_rect = None
-        self.face_tracking_frames = 0
-        self.max_tracking_frames = 30
-        
-    def _load_user_encodings(self):
-        """Pre-load all user face encodings"""
-        print("Pre-loading user face encodings...")
-        start_time = time.time()
-        users = self.user_profiles.get_all_users()
-        loaded_count = 0
-        
-        for user_id, user_data in users.items():
-            if 'embedding' in user_data:
-                # If embedding is already saved in the user profile
-                self.reference_encodings[user_id] = {
-                    'encoding': np.array(user_data['embedding']),
-                    'first_name': user_data['first_name'],
-                    'last_name': user_data['last_name']
-                }
-                loaded_count += 1
-            elif 'image_path' in user_data and os.path.exists(user_data['image_path']):
-                # Load image and compute encoding
-                try:
-                    stored_image = cv2.imread(user_data['image_path'])
-                    if stored_image is not None:
-                        stored_rgb = cv2.cvtColor(stored_image, cv2.COLOR_BGR2RGB)
-                        encoding = self.get_face_encoding(stored_rgb)
-                        
-                        if encoding is not None:
-                            self.reference_encodings[user_id] = {
-                                'encoding': encoding,
-                                'first_name': user_data['first_name'],
-                                'last_name': user_data['last_name']
-                            }
-                            
-                            # Save encoding back to user profile for future use
-                            user_data['embedding'] = encoding.tolist()
-                            self.user_profiles.add_user(user_id, user_data)
-                            loaded_count += 1
-                except Exception as e:
-                    print(f"Error loading image for user {user_id}: {e}")
-        
-        print(f"Loaded {loaded_count} user encodings in {time.time() - start_time:.2f} seconds")
-                
-    def get_face_encoding(self, image):
-        """Extract face encoding from image"""
-        try:
-            faces = self.detector(image)
-            if len(faces) == 0:
-                return None
-            
-            face = faces[0]
-            shape = self.shape_predictor(image, face)
-            face_encoding = np.array(self.face_recognizer.compute_face_descriptor(image, shape))
-            return face_encoding
-        except Exception as e:
-            print(f"Error getting face encoding: {e}")
-            return None
+# Add parent directory to path
+sys.path.append(str(Path(__file__).parent.parent))
+from data.users import user_manager
+from engine.Core import DynamicFaceEvaluator
+
+class FaceRecognizer:
+    """Class to recognize faces of registered users"""
     
-    def compare_faces(self, known_encoding, unknown_encoding):
-        """Compare two face encodings and return distance"""
-        if known_encoding is None or unknown_encoding is None:
-            return 1.0
+    def __init__(self, recognition_threshold=0.6):
+        """Initialize the face recognizer with models and thresholds"""
+        # Path to face recognition model
+        models_dir = Path(__file__).parent.parent / "models"
+        self.face_rec_model_path = models_dir / "dlib_face_recognition_resnet_model_v1.dat"
+        self.shape_predictor_path = models_dir / "shape_predictor_68_face_landmarks.dat"
         
-        return np.linalg.norm(known_encoding - unknown_encoding)
-
-    def recognize_face(self, encoding, face_id=None):
-        """Recognize face using pre-loaded encodings"""
-        if encoding is None:
-            return None
+        # Initialize face detection/analysis components
+        self.detector = dlib.get_frontal_face_detector()
+        self.shape_predictor = dlib.shape_predictor(str(self.shape_predictor_path))
+        self.face_rec_model = dlib.face_recognition_model_v1(str(self.face_rec_model_path))
         
-        # Check cache for this face_id if provided
-        current_time = time.time()
-        if face_id is not None and face_id in self.recognition_cache:
-            cache_entry = self.recognition_cache[face_id]
-            if current_time - cache_entry['time'] < self.cache_lifetime:
-                # Cache hit - return cached result
-                return cache_entry['result']
+        # Set recognition threshold (lower = stricter matching)
+        self.recognition_threshold = recognition_threshold
+        
+        # Use the face evaluator for better face position analysis
+        self.face_evaluator = DynamicFaceEvaluator()
+        
+        # Cache of known face encodings
+        self.known_face_encodings = []
+        self.known_user_ids = []
+        self.load_known_faces()
+        
+    def load_known_faces(self):
+        """Load all registered user faces and compute their encodings"""
+        print("Loading known faces...")
+        start_time = time.time()
+        
+        # Clear existing cache
+        self.known_face_encodings = []
+        self.known_user_ids = []
+        
+        # Get all registered users
+        all_users = user_manager.get_all_users()
+        total_images = 0
+        
+        for user in all_users:
+            user_id = user['id']
+            print(f"Processing user: {user['first_name']} {user['last_name']}")
             
-        # No cache hit, perform recognition
-        best_match = None
-        min_distance = float('inf')
-        
-        # Use numpy vectorization for faster comparison when possible
-        if len(self.reference_encodings) > 0:
-            # Create a single array of all encodings for vectorized comparison
-            user_ids = list(self.reference_encodings.keys())
-            encoding_array = np.array([self.reference_encodings[uid]['encoding'] for uid in user_ids])
-            
-            # Calculate distances to all encodings at once
-            distances = np.linalg.norm(encoding_array - encoding, axis=1)
-            
-            # Find the minimum distance
-            min_idx = np.argmin(distances)
-            min_distance = distances[min_idx]
-            
-            if min_distance < self.threshold:
-                user_id = user_ids[min_idx]
-                user_data = self.reference_encodings[user_id]
-                best_match = {
-                    'first_name': user_data['first_name'],
-                    'last_name': user_data['last_name'],
-                    'user_id': user_id,
-                    'distance': min_distance,
-                    'confidence': 1.0 - (min_distance / self.threshold)
-                }
-                
-                # Cache the result
-                if face_id is not None:
-                    self.recognition_cache[face_id] = {
-                        'time': current_time,
-                        'result': best_match
-                    }
-        
-        return best_match
-
-    def detect_and_recognize(self, frame, fast_mode=True):
-        """
-        Detect and recognize faces in frame
-        Returns: List of dicts with face info
-        """
-        h, w = frame.shape[:2]
-        results = []
-        
-        # Use fast mode with tracking optimizations
-        if fast_mode and self.last_face_rect is not None and self.face_tracking_frames < self.max_tracking_frames:
-            # Expand search region by 20%
-            x, y, x2, y2 = self.last_face_rect
-            expansion = 0.2
-            search_left = max(0, int(x - w * expansion))
-            search_top = max(0, int(y - h * expansion))
-            search_right = min(w, int(x2 + w * expansion))
-            search_bottom = min(h, int(y2 + h * expansion))
-            
-            # Extract ROI
-            roi = frame[search_top:search_bottom, search_left:search_right]
-            if roi.size > 0:
-                # Detect in ROI
-                roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                faces = self.detector(roi_gray)
-                
-                # If found in ROI, adjust coordinates
-                if len(faces) > 0:
-                    for face in faces:
-                        x = face.left() + search_left
-                        y = face.top() + search_top
-                        w = face.width()
-                        h = face.height()
-                        right = x + w
-                        bottom = y + h
-                        
-                        # Update tracking
-                        self.last_face_rect = (x, y, right, bottom)
-                        self.face_tracking_frames = 0
-                        
-                        # Extract face and create result
-                        face_img = frame[y:bottom, x:right]
-                        if face_img.size > 0:
-                            face_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-                            face_encoding = self.get_face_encoding(face_rgb)
-                            
-                            # Generate unique face ID
-                            face_id = f"face_{x}_{y}_{w}_{h}"
-                            
-                            # Get recognition results
-                            match = self.recognize_face(face_encoding, face_id)
-                            
-                            results.append({
-                                'rect': (x, y, right, bottom),
-                                'encoding': face_encoding,
-                                'match': match,
-                                'face_id': face_id
-                            })
-                    
-                    # Exit if faces found in ROI
-                    if results:
-                        return results
-        
-        # Fall back to full frame detection if ROI failed or not using fast mode
-        self.face_tracking_frames += 1
-        
-        # Convert to gray for faster detection
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.detector(gray)
-        
-        for face in faces:
-            x = face.left()
-            y = face.top()
-            w = face.width()
-            h = face.height()
-            right = x + w
-            bottom = y + h
-            
-            # Update tracking for next frame
-            self.last_face_rect = (x, y, right, bottom)
-            self.face_tracking_frames = 0
-            
-            # Extract face region
-            face_img = frame[y:bottom, x:right]
-            if face_img.size == 0:
+            # Load user's face images
+            image_tuples = user_manager.load_user_face_images(user_id)
+            if not image_tuples:
+                print(f"Warning: No face images found for user {user_id}")
                 continue
                 
-            # Generate unique face ID
-            face_id = f"face_{x}_{y}_{w}_{h}"
-            
-            # Get encoding and recognition
-            rgb_face = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-            face_encoding = self.get_face_encoding(rgb_face)
-            match = self.recognize_face(face_encoding, face_id)
-            
-            results.append({
-                'rect': (x, y, right, bottom),
-                'encoding': face_encoding,
-                'match': match,
-                'face_id': face_id
-            })
-        
-        return results
-
-def run_recognition():
-    """Main function to run face recognition"""
-    print("Initializing face recognition...")
-    start_time = time.time()
-    
-    try:
-        face_recognition = FaceRecognition()
-        print(f"Initialization complete in {time.time() - start_time:.2f} seconds")
-    except Exception as e:
-        print(f"Failed to initialize face recognition: {e}")
-        return
-    
-    # Open camera
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Error: Could not open camera.")
-        return
-        
-    # Set camera resolution for better performance
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    
-    # For FPS calculation
-    frame_count = 0
-    fps_start_time = time.time()
-    fps = 0
-    
-    # Multi-threading setup
-    frame_queue = Queue(maxsize=1)
-    result_queue = Queue(maxsize=2)
-    stop_event = threading.Event()
-    
-    # Skip frames for better performance
-    process_every_n_frames = 4  # Higher value = better performance but more lag
-    frame_counter = 0
-    
-    # For display
-    display_frame = None
-    recognition_results = []
-    resolution = (1280, 720)  # Default resolution
-    
-    def process_frames():
-        """Background thread for face recognition"""
-        while not stop_event.is_set():
-            try:
-                # Get frame from queue with timeout
-                frame = frame_queue.get(timeout=0.1)
+            for img_path, img in image_tuples:
+                # Convert to grayscale for face detection
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 
-                # Process frame
-                results = face_recognition.detect_and_recognize(frame, fast_mode=True)
+                # Detect faces
+                faces = self.detector(gray)
+                if len(faces) == 0:
+                    print(f"Warning: No face detected in image {img_path}")
+                    continue
                 
-                # Store results in queue
-                if not result_queue.full():
-                    result_queue.put((frame, results))
-            except Exception as e:
-                if not isinstance(e, TimeoutError) and not stop_event.is_set():
-                    print(f"Error in processing thread: {e}")
+                # Use the largest face if multiple detected
+                face_rect = max(faces, key=lambda rect: rect.area())
+                
+                # Get face landmarks
+                shape = self.shape_predictor(img, face_rect)
+                
+                # Compute face encoding (128-dimensional face descriptor)
+                face_encoding = self.face_rec_model.compute_face_descriptor(img, shape)
+                face_encoding_np = np.array(face_encoding)
+                
+                # Add to known faces
+                self.known_face_encodings.append(face_encoding_np)
+                self.known_user_ids.append(user_id)
+                total_images += 1
+        
+        elapsed_time = time.time() - start_time
+        print(f"Loaded {len(self.known_face_encodings)} face encodings from {len(all_users)} users in {elapsed_time:.2f} seconds")
+        return total_images
     
-    # Start processing thread
-    processor = threading.Thread(target=process_frames)
-    processor.daemon = True
-    processor.start()
+    def recognize_face(self, frame, min_quality_score=70):
+        """Recognize a face in the given frame"""
+        # Evaluate face quality
+        score, feedback, annotated = self.face_evaluator.evaluate_face_position(frame)
+        
+        # If face quality is too low, don't attempt recognition
+        if score < min_quality_score:
+            return None, score, "Face quality too low for reliable recognition", annotated
+        
+        # Convert to grayscale for face detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Detect faces
+        faces = self.detector(gray)
+        if len(faces) == 0:
+            return None, score, "No face detected", annotated
+        
+        # Use the largest face if multiple detected
+        face_rect = max(faces, key=lambda rect: rect.area())
+        
+        # Get face landmarks
+        shape = self.shape_predictor(frame, face_rect)
+        
+        # Compute face encoding
+        face_encoding = self.face_rec_model.compute_face_descriptor(frame, shape)
+        face_encoding_np = np.array(face_encoding)
+        
+        # If no known faces, return unknown
+        if len(self.known_face_encodings) == 0:
+            return None, score, "No known faces to compare with", annotated
+        
+        # Calculate distances to all known faces
+        distances = []
+        for known_encoding in self.known_face_encodings:
+            # Euclidean distance between face encodings
+            distance = np.linalg.norm(face_encoding_np - known_encoding)
+            distances.append(distance)
+        
+        # Find the closest match
+        best_match_idx = np.argmin(distances)
+        best_match_distance = distances[best_match_idx]
+        
+        # Check if the match is close enough
+        if best_match_distance <= self.recognition_threshold:
+            recognized_user_id = self.known_user_ids[best_match_idx]
+            
+            # Get user details
+            user_info = user_manager.get_user_by_id(recognized_user_id)
+            first_name = user_info.get('first_name', 'Unknown')
+            last_name = user_info.get('last_name', 'User')
+            
+            # Add recognition info to the annotated frame
+            cv2.putText(annotated, f"Recognized: {first_name} {last_name}", 
+                       (20, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(annotated, f"Match confidence: {(1-best_match_distance)*100:.1f}%", 
+                       (20, 350), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            return user_info, score, f"Recognized: {first_name} {last_name}", annotated
+        else:
+            # Add unknown user info to the annotated frame
+            cv2.putText(annotated, "Unknown person", 
+                       (20, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.putText(annotated, f"Best match distance: {best_match_distance:.3f}", 
+                       (20, 350), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            return None, score, "Unknown person", annotated
     
-    print("Face recognition started. Press 'q' to quit, '+'/'-' to adjust processing rate.")
-
-    try:
+    def recognition_loop(self):
+        """Run a continuous recognition loop with camera input"""
+        print("\nStarting face recognition...")
+        print("Press 'q' or ESC to quit, 'r' to reload known faces")
+        
+        # Initialize camera
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        
+        # FPS tracking
+        frame_count = 0
+        start_time = time.time()
+        fps = 0
+        
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("Error: Failed to capture frame.")
+                print("Error reading from camera")
                 break
-                
-            # Get frame resolution if not set yet
-            if resolution[0] == 0:
-                h, w = frame.shape[:2]
-                resolution = (w, h)
             
-            frame_counter += 1
-            
-            # Queue frame for processing at specified intervals
-            if frame_counter % process_every_n_frames == 0:
-                # Replace any existing frame in the queue
-                while not frame_queue.empty():
-                    try:
-                        frame_queue.get_nowait()
-                    except:
-                        pass
-                
-                # Add new frame to queue
-                try:
-                    frame_queue.put_nowait(frame.copy())
-                except:
-                    pass  # Queue is full, will try next frame
-            
-            # Get latest results if available
-            try:
-                if not result_queue.empty():
-                    last_processed_frame, recognition_results = result_queue.get_nowait()
-                    display_frame = last_processed_frame.copy()
-            except:
-                pass
-                
-            # Create display frame
-            if display_frame is None:
-                display_frame = frame.copy()
-            else:
-                # Use the latest frame but keep recognition results from processed frame
-                display_frame = frame.copy()
-            
-            # Draw results on the display frame
-            for face_data in recognition_results:
-                x, y, right, bottom = face_data['rect']
-                match = face_data['match']
-                
-                # Draw rectangle around detected face
-                cv2.rectangle(display_frame, (x, y), (right, bottom), (0, 255, 0), 2)
-                
-                if match:
-                    confidence = match['confidence'] * 100
-                    name = f"{match['first_name']} {match['last_name']}"
-                    conf_text = f"{confidence:.1f}%"
-                    
-                    # Color gradient from red (0%) to green (100%)
-                    color = (
-                        0,
-                        int(255 * (confidence / 100)),
-                        int(255 * (1 - confidence / 100))
-                    )
-                    
-                    cv2.putText(display_frame, f"{name} ({conf_text})", 
-                              (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-                else:
-                    cv2.putText(display_frame, "Unknown", 
-                              (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-            
-            # Calculate and display FPS
+            # Update FPS calculation
             frame_count += 1
-            elapsed_time = time.time() - fps_start_time
-            if elapsed_time > 1:
+            elapsed_time = time.time() - start_time
+            if elapsed_time >= 1.0:
                 fps = frame_count / elapsed_time
                 frame_count = 0
-                fps_start_time = time.time()
-                
-            cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                       
-            # Show processing speed info
-            cv2.putText(display_frame, f"Processing: 1/{process_every_n_frames} frames", 
-                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-            cv2.imshow('Face Recognition', display_frame)
+                start_time = time.time()
             
+            # Perform recognition
+            user, score, message, annotated = self.recognize_face(frame)
+            
+            # Add FPS display
+            cv2.putText(annotated, f"FPS: {fps:.1f}", 
+                       (annotated.shape[1] - 120, 30), cv2.FONT_HERSHEY_SIMPLEX, 
+                       0.7, (0, 255, 255), 2)
+            
+            # Display the annotated frame
+            cv2.imshow("Face Recognition", annotated)
+            
+            # Handle keyboard input
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            if key == 27 or key == ord('q'):  # ESC or q to quit
                 break
-            elif key == ord('+') and process_every_n_frames > 1:
-                process_every_n_frames -= 1
-                print(f"Processing 1/{process_every_n_frames} frames")
-            elif key == ord('-'):
-                process_every_n_frames += 1
-                print(f"Processing 1/{process_every_n_frames} frames")
-
-    except Exception as e:
-        print(f"Error in main loop: {e}")
-    finally:
+            elif key == ord('r'):  # r to reload face database
+                print("Reloading face database...")
+                self.load_known_faces()
+        
         # Clean up
-        stop_event.set()
-        if processor.is_alive():
-            processor.join(timeout=1.0)
         cap.release()
         cv2.destroyAllWindows()
-        print("Face recognition stopped.")
+    
+    def recognize_single_frame(self, frame=None):
+        """Capture a single frame and perform recognition, or use provided frame"""
+        if frame is None:
+            # Initialize camera
+            cap = cv2.VideoCapture(0)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            
+            # Capture a single frame
+            ret, frame = cap.read()
+            cap.release()
+            
+            if not ret:
+                print("Error reading from camera")
+                return None, 0, "Camera error", None
+        
+        # Perform recognition
+        return self.recognize_face(frame)
+
+class OptimizedFaceRecognizer(FaceRecognizer):
+    def __init__(self, recognition_threshold=0.6):
+        """Initialize with optimized storage and searching"""
+        super().__init__(recognition_threshold)
+        
+        # Replace in-memory arrays with indexed storage
+        self.db_path = Path(__file__).parent.parent / "data" / "face_encodings.db"
+        self.index_path = Path(__file__).parent.parent / "data" / "face_index.faiss"
+        
+        # Initialize database connection
+        self._init_database()
+        
+        # Set up FAISS index for fast nearest-neighbor search
+        self.dimension = 128  # dlib face encodings are 128-dimensional
+        self.index = None
+        self._init_index()
+        
+        # Cache for frequently accessed users
+        self.cache_size = 50
+        self.user_cache = {}
+        
+    def _init_database(self):
+        """Initialize SQLite database for face encodings"""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        
+        # Create tables if they don't exist
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            first_name TEXT,
+            last_name TEXT,
+            created_at TIMESTAMP,
+            last_access TIMESTAMP
+        )
+        ''')
+        
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS face_encodings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            encoding BLOB,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        
+    def _init_index(self):
+        """Initialize FAISS index for fast similarity search"""
+        if os.path.exists(self.index_path):
+            # Load existing index
+            self.index = faiss.read_index(str(self.index_path))
+            print(f"Loaded FAISS index with {self.index.ntotal} vectors")
+        else:
+            # Create new index - using L2 distance and flat index for accuracy
+            self.index = faiss.IndexFlatL2(self.dimension)
+            print("Created new FAISS index")
+            
+    def load_known_faces(self):
+        """Load faces into index instead of memory arrays"""
+        # Check if database already has data
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        user_count = cursor.fetchone()[0]
+        
+        if user_count > 0 and os.path.exists(self.index_path):
+            print(f"Using existing database with {user_count} users")
+            # Load the FAISS index instead of rebuilding
+            return
+        
+        print("Building optimized face recognition index...")
+        start_time = time.time()
+        
+        # Clear index and rebuild
+        self.index = faiss.IndexFlatL2(self.dimension)
+        
+        # Get all registered users
+        all_users = user_manager.get_all_users()
+        total_images = 0
+        
+        # Create database connection
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        
+        # Clear existing data
+        cursor.execute("DELETE FROM face_encodings")
+        cursor.execute("DELETE FROM users")
+        
+        # Temporary arrays to build the index
+        all_encodings = []
+        user_ids = []
+        
+        for user in all_users:
+            user_id = user['id']
+            
+            # Get creation time from user data or use current time
+            # If user data contains capture_date, use that
+            created_at = user.get('capture_date', time.time())
+            
+            # Add user to database with both timestamps
+            cursor.execute(
+                "INSERT INTO users VALUES (?, ?, ?, ?, ?)",
+                (user_id, user['first_name'], user['last_name'], created_at, time.time())
+            )
+            
+            # Load user's face images
+            image_tuples = user_manager.load_user_face_images(user_id)
+            if not image_tuples:
+                continue
+            
+            for img_path, img in image_tuples:
+                # Process and get face encoding
+                encoding = self._process_face_image(img)
+                if encoding is None:
+                    continue
+                
+                # Add to temporary arrays
+                all_encodings.append(encoding)
+                user_ids.append(user_id)
+                
+                # Store in database
+                encoding_blob = pickle.dumps(encoding)
+                cursor.execute(
+                    "INSERT INTO face_encodings (user_id, encoding) VALUES (?, ?)",
+                    (user_id, encoding_blob)
+                )
+                
+                total_images += 1
+        
+        # Add all encodings to FAISS index at once (much faster than one at a time)
+        if all_encodings:
+            encodings_array = np.array(all_encodings).astype('float32')
+            self.index.add(encodings_array)
+            
+            # Map FAISS indices to user IDs
+            with open(str(self.index_path).replace('.faiss', '_map.pkl'), 'wb') as f:
+                pickle.dump(user_ids, f)
+        
+        conn.commit()
+        conn.close()
+        
+        # Save index
+        faiss.write_index(self.index, str(self.index_path))
+        
+        elapsed_time = time.time() - start_time
+        print(f"Built index with {total_images} face encodings from {len(all_users)} users in {elapsed_time:.2f} seconds")
+        return total_images
+        
+    def _process_face_image(self, img):
+        """Extract face encoding from an image"""
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = self.detector(gray)
+        if len(faces) == 0:
+            return None
+            
+        face_rect = max(faces, key=lambda rect: rect.area())
+        shape = self.shape_predictor(img, face_rect)
+        face_encoding = self.face_rec_model.compute_face_descriptor(img, shape)
+        return np.array(face_encoding)
+        
+    def recognize_face(self, frame, min_quality_score=70):
+        """Optimized face recognition using FAISS index"""
+        # Face quality evaluation stays the same
+        score, feedback, annotated = self.face_evaluator.evaluate_face_position(frame)
+        
+        if score < min_quality_score:
+            return None, score, "Face quality too low for reliable recognition", annotated
+            
+        # Get face encoding
+        face_encoding = self._process_face_image(frame)
+        if face_encoding is None:
+            return None, score, "No face detected", annotated
+            
+        # Check if index is empty
+        if self.index.ntotal == 0:
+            return None, score, "No known faces to compare with", annotated
+            
+        # Search in FAISS index
+        query = np.array([face_encoding]).astype('float32')
+        distances, indices = self.index.search(query, 1)  # Get closest match
+        
+        distance = distances[0][0]
+        best_match_idx = indices[0][0]
+        
+        # Convert distance to confidence (1.0 is perfect match)
+        confidence = max(0, 1.0 - distance)
+        
+        # Check if the match is close enough
+        if distance <= self.recognition_threshold:
+            # Load user ID mapping
+            with open(str(self.index_path).replace('.faiss', '_map.pkl'), 'rb') as f:
+                user_ids = pickle.load(f)
+            
+            # Get user ID and info
+            user_id = user_ids[best_match_idx]
+            
+            # Check cache first
+            if user_id in self.user_cache:
+                user_info = self.user_cache[user_id]
+            else:
+                # Get from database/user manager
+                user_info = user_manager.get_user_by_id(user_id)
+                
+                # Update cache (LRU-like)
+                if len(self.user_cache) >= self.cache_size:
+                    # Remove least recently used
+                    lru_id = min(self.user_cache, key=lambda k: self.user_cache[k].get('_last_access', 0))
+                    del self.user_cache[lru_id]
+                
+                # Add to cache with timestamp
+                user_info['_last_access'] = time.time()
+                self.user_cache[user_id] = user_info
+            
+            # Add recognition info to annotated frame (same as before)
+            first_name = user_info.get('first_name', 'Unknown')
+            last_name = user_info.get('last_name', 'User')
+            
+            cv2.putText(annotated, f"Recognized: {first_name} {last_name}", 
+                      (20, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(annotated, f"Match confidence: {confidence*100:.1f}%", 
+                      (20, 350), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            return user_info, score, f"Recognized: {first_name} {last_name}", annotated
+        else:
+            # Unknown person (same as before)
+            cv2.putText(annotated, "Unknown person", 
+                      (20, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.putText(annotated, f"Best match distance: {distance:.3f}", 
+                      (20, 350), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            return None, score, "Unknown person", annotated
+
+def get_recognition_model():
+    """Returns a configured face recognition model for use by other modules"""
+    # Should use optimized version instead
+    try:
+        recognizer = OptimizedFaceRecognizer()
+        print("Using optimized face recognizer")
+    except Exception as e:
+        print(f"Falling back to standard recognizer: {e}")
+        recognizer = FaceRecognizer()
+    return recognizer
+
+def recognize_face(face_image, recognition_model=None):
+    """Recognize a face and return name and confidence score
+    
+    Args:
+        face_image: Image containing a face to recognize
+        recognition_model: Optional pre-loaded recognition model
+        
+    Returns:
+        Tuple of (name, confidence_score)
+    """
+    if recognition_model is None:
+        recognition_model = get_recognition_model()
+    
+    # Get recognition result (expecting a tuple of result, score, message, annotated_image)
+    result, score, message, _ = recognition_model.recognize_face(face_image)
+    
+    # Extract name if result is a dictionary 
+    if isinstance(result, dict):
+        if 'first_name' in result and 'last_name' in result:
+            name = f"{result['first_name']} {result['last_name']}"
+        else:
+            name = str(result.get('id', 'Unknown'))
+        return name, score
+    
+    return result, score
+
+def main():
+    """Main function to run the face recognition utility"""
+    print("=== Face Recognition Utility ===")
+    
+    # Initialize face recognizer
+    recognizer = FaceRecognizer()
+    
+    # Start recognition loop
+    recognizer.recognition_loop()
 
 if __name__ == "__main__":
-    run_recognition()
+    main()
